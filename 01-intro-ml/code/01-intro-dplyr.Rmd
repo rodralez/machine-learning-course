@@ -1,0 +1,210 @@
+---
+title: "dplyr Verbs"
+output: html_notebook
+---
+
+
+```{r message=FALSE}
+library(dplyr)
+library(readr)
+```
+
+
+
+
+
+# Read  dataset
+```{r}
+base_data<-read_csv("../../rawdata/consumo_db.csv",col_types = cols())
+base_data
+```
+
+There are several commonly used verbs in the dplyr package that are useful for manipulating and summarizing data. Here are some of the most common verbs in dplyr:
+
+# filter(): This verb is used to select rows of a data frame based on certain conditions.
+
+
+```{r}
+base_data %>% filter(SalesOrder=="34046361")
+```
+
+
+
+# select(): This verb is used to select specific columns of a data frame.
+
+
+```{r}
+base_data %>% select(SalesOrder,UM)
+```
+
+
+# group_by(): This verb is used to group the rows of a data frame by one or more columns.
+
+
+```{r}
+base_data %>% group_by(EnduserCode) %>% count()
+```
+
+
+# arrange(): This verb is used to sort the rows of a data frame by one or more columns.
+
+```{r}
+base_data %>% group_by(EnduserCode) %>% count() %>% arrange(n %>% desc())
+```
+
+
+# mutate(): This verb is used to create new columns in a data frame based on existing columns.
+
+```{r}
+base_data<-base_data %>% mutate(InvoiceQty=as.numeric(InvoiceQty))
+```
+
+
+# mutate() Convert to date type
+
+```{r}
+base_data<-base_data %>% mutate( date = lubridate::dmy(InvoiceDate))
+```
+## Plot
+
+```{r fig.height=4, fig.width=10}
+base_data %>% filter(!EnduserCode %>% is.na())
+
+base_data %>% filter(EnduserCode == "Client 002") %>% select(date,ShipQty) %>% tidyr::drop_na() %>% group_by(date) %>% 
+  summarise(ShipQty=sum(ShipQty)) %>%
+  ggplot()+
+  geom_line(aes(x=date,y=ShipQty),color='red')+
+  geom_point(aes(x=date,y=ShipQty),color='orange')+
+  
+  theme_bw()
+```
+
+
+
+
+# summarize(): This verb is used to calculate summary statistics of a data frame, such as mean, median, or total.
+
+```{r}
+base_data %>% group_by(EnduserCode) %>% summarise(qty=sum(InvoiceQty,na.rm = T))
+```
+
+
+# OK, let's build a model...
+
+
+**Q1: Can we predict the shipQty considering : **
+                   * "Region",
+                   * "Process",
+                   * "StringGroup",
+                   * "WellName"
+
+## Aggregate ShipQty by User and SalesOrder
+```{r}
+aggregated_salesorder_data<-base_data %>% group_by(EnduserCode,SalesOrder) %>% summarise(sales_order_num=n(),
+                                                                                         sum_Shipqty=sum(ShipQty)) 
+aggregated_salesorder_data
+```
+
+## Select only SalesOrders with same data in the shipment
+
+
+```{r}
+select_sales_orders<-base_data %>% 
+  select(SalesOrder,Region,Process,StringGroup,WellName) %>% 
+  unique() %>% mutate(SalesOrder=as.factor(SalesOrder)) %>% 
+  group_by(SalesOrder) %>% 
+  summarise(n=n()) %>% filter(n==1) %>% 
+  select(SalesOrder)%>% unlist() %>% 
+  unname()
+
+aggregated_salesorder_data <- aggregated_salesorder_data %>% 
+  filter( SalesOrder %in% select_sales_orders)
+```
+
+
+
+```{r}
+aggregated_salesorder_data <- left_join(aggregated_salesorder_data, base_data %>%
+                                        select(SalesOrder,Region,Process,StringGroup,WellName) %>% 
+                                          unique(), by="SalesOrder")
+```
+
+## Split well info to reduce the levels of the column
+```{r}
+aggregated_salesorder_data<-aggregated_salesorder_data %>% 
+  mutate(WellName=stringr::str_split(WellName,pattern = " ")[[1]][1]) 
+```
+
+# Split train and test
+```{r}
+library(caret)
+trainset <- aggregated_salesorder_data %>% ungroup() %>% na.omit() %>% sample_frac(0.7)
+testset <- setdiff(aggregated_salesorder_data %>% ungroup(),trainset)
+```
+
+# Train simple Model
+
+```{r message=FALSE}
+library(caret)
+library(doMC)
+registerDoMC(cores = 4)
+selected_variables<-c(#"sales_order_num",
+                   "Region",
+                   "Process",
+                   "StringGroup",
+                   "WellName"
+                   )
+ctrl_fast <- trainControl(
+  method = "repeatedcv",
+  repeats = 2,
+  number = 5,
+  returnResamp = 'final',
+  savePredictions = 'final',
+  verboseIter = F,
+  allowParallel = T
+)
+
+
+cartFit <- caret::train(
+  x = trainset %>%  select(selected_variables),
+  y = trainset %>%  select(sum_Shipqty) %>% unname() %>% unlist(),
+  method = "rf",
+  tuneLength=3,
+  #verbose = 2,
+  trControl = ctrl_fast,
+  ntree = 500
+)
+```
+
+# Model results
+```{r}
+cartFit$results
+cartFit$finalModel
+```
+
+# Resample (CV) results
+```{r}
+cartFit$results %>%
+  ggplot(aes(x=mtry,y=Rsquared))+
+  geom_point(color = 'red') +
+  geom_errorbar(aes(ymin=Rsquared-RsquaredSD,ymax=Rsquared+RsquaredSD),width=0.2)+
+  theme_classic()
+```
+
+# Test Results
+```{r}
+testset <- testset %>% na.omit()
+predictions<-predict(cartFit,testset)
+predictions<-data.frame(pred=predictions,obs=testset$sum_Shipqty %>% na.omit())
+Rsquared<-postResample(pred=predictions$pred,obs=predictions$obs)[[2]]
+predictions %>% 
+  ggplot(aes(pred,obs))+
+  geom_point(shape=21,alpha=0.5)+
+  #geom_label(y=300,x=10,label=paste("R^2:",round(Rsquared,digits = 4)),color="blue",size=4,)+
+  labs(title="Random Forest for Aggregated shpQty", subtitle="Predicted vs. Observed")+
+  geom_abline(intercept = 0,
+              slope = 1,
+              color = "red",
+              size = 1)+
+  theme_bw()
+```
